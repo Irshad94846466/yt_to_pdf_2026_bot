@@ -3,10 +3,12 @@ import re
 import time
 import threading
 import requests
-from io import BytesIO
 
+from io import BytesIO
 from flask import Flask
+
 from youtube_transcript_api import YouTubeTranscriptApi
+
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
     SimpleDocTemplate,
@@ -19,33 +21,44 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+
 from PIL import Image as PILImage
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is missing")
+    print("ERROR: BOT_TOKEN environment variable is missing.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 app = Flask(__name__)
 
 
+# =========================================================
+# HEALTH CHECK
+# =========================================================
+
 @app.route("/")
 def home():
     return "YouTube PDF Bot is running!"
 
 
-# -----------------------------
-# GET YOUTUBE VIDEO ID
-# -----------------------------
+# =========================================================
+# YOUTUBE VIDEO ID
+# =========================================================
+
 def get_video_id(url):
     patterns = [
         r"(?:youtube\.com/watch\?v=)([A-Za-z0-9_-]{11})",
         r"(?:youtu\.be/)([A-Za-z0-9_-]{11})",
         r"(?:youtube\.com/shorts/)([A-Za-z0-9_-]{11})",
         r"(?:youtube\.com/embed/)([A-Za-z0-9_-]{11})",
-        r"(?:youtube\.com/live/)([A-Za-z0-9_-]{11})",
+        r"(?:youtube\.com/live/)([A-Za-z0-9_-]{11})"
     ]
 
     for pattern in patterns:
@@ -57,16 +70,23 @@ def get_video_id(url):
     return None
 
 
-# -----------------------------
-# GET VIDEO TITLE
-# -----------------------------
+# =========================================================
+# YOUTUBE TITLE
+# =========================================================
+
 def get_video_title(video_id):
     try:
         url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
 
-        response = requests.get(url, timeout=20)
+        response = requests.get(
+            url,
+            timeout=15,
+            headers={
+                "User-Agent": "Mozilla/5.0"
+            }
+        )
 
-        if response.ok:
+        if response.status_code == 200:
             data = response.json()
             return data.get("title", "YouTube Video")
 
@@ -76,26 +96,29 @@ def get_video_title(video_id):
     return "YouTube Video"
 
 
-# -----------------------------
-# GET THUMBNAIL
-# -----------------------------
+# =========================================================
+# YOUTUBE THUMBNAIL
+# =========================================================
+
 def get_thumbnail(video_id):
-    thumbnail_urls = [
-        f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
-        f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+    urls = [
+        f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
     ]
 
-    for url in thumbnail_urls:
+    for url in urls:
 
         try:
-            response = requests.get(url, timeout=20)
+            response = requests.get(
+                url,
+                timeout=15,
+                headers={
+                    "User-Agent": "Mozilla/5.0"
+                }
+            )
 
-            if response.ok:
-
-                image = PILImage.open(BytesIO(response.content))
-                image.load()
-
-                return image
+            if response.status_code == 200:
+                return response.content
 
         except Exception as e:
             print("THUMBNAIL ERROR:", e)
@@ -103,93 +126,65 @@ def get_thumbnail(video_id):
     return None
 
 
-# -----------------------------
+# =========================================================
 # GET TRANSCRIPT
-# -----------------------------
+# =========================================================
+
 def get_transcript(video_id):
 
     api = YouTubeTranscriptApi()
 
+    # Method 1
     try:
-
         transcript = api.fetch(
             video_id,
-            languages=["hi", "en"]
+            languages=["hi", "en", "ur"]
         )
 
         text = []
 
         for item in transcript:
-            if hasattr(item, "text"):
-                text.append(item.text)
-            else:
-                text.append(item["text"])
+            text.append(item.text)
 
-        return " ".join(text)
+        if text:
+            return "\n".join(text)
 
     except Exception as e:
+        print("TRANSCRIPT METHOD 1 ERROR:", repr(e))
 
-        print("TRANSCRIPT ERROR:", e)
+    # Method 2
+    try:
+        transcripts = api.list(video_id)
 
-        try:
+        for transcript in transcripts:
 
-            transcript_list = api.list(video_id)
-
-            for transcript in transcript_list:
-
+            try:
                 fetched = transcript.fetch()
 
                 text = []
 
                 for item in fetched:
-
-                    if hasattr(item, "text"):
-                        text.append(item.text)
-                    else:
-                        text.append(item["text"])
+                    text.append(item.text)
 
                 if text:
-                    return " ".join(text)
+                    return "\n".join(text)
 
-        except Exception as e2:
+            except Exception as e:
+                print("TRANSCRIPT FETCH ERROR:", repr(e))
 
-            print("TRANSCRIPT FALLBACK ERROR:", e2)
+    except Exception as e:
+        print("TRANSCRIPT METHOD 2 ERROR:", repr(e))
 
-        raise Exception(
-            "Is video ka transcript/captions available nahi hai."
-        )
+    return None
 
 
-# -----------------------------
+# =========================================================
 # CREATE PDF
-# -----------------------------
-def create_pdf(text, video_url, video_id, title):
+# =========================================================
 
-    filename = f"/tmp/youtube_notes_{int(time.time())}.pdf"
+def create_pdf(title, video_id, transcript, thumbnail_data):
 
-    # Font
-    font_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf"
-    ]
-
-    font_name = "Helvetica"
-
-    for path in font_paths:
-
-        if os.path.exists(path):
-
-            try:
-
-                pdfmetrics.registerFont(
-                    TTFont("DejaVu", path)
-                )
-
-                font_name = "DejaVu"
-                break
-
-            except Exception:
-                pass
+    filename = f"/tmp/youtube_{video_id}.pdf"
 
     doc = SimpleDocTemplate(
         filename,
@@ -203,164 +198,157 @@ def create_pdf(text, video_url, video_id, title):
     styles = getSampleStyleSheet()
 
     title_style = ParagraphStyle(
-        "TitleCustom",
+        "TitleStyle",
         parent=styles["Title"],
-        fontName=font_name,
-        fontSize=18,
         alignment=TA_CENTER,
+        fontSize=18,
+        leading=23,
         spaceAfter=15
     )
 
-    heading_style = ParagraphStyle(
-        "HeadingCustom",
-        parent=styles["Heading2"],
-        fontName=font_name,
-        fontSize=14,
-        spaceBefore=15,
-        spaceAfter=10
-    )
-
-    body_style = ParagraphStyle(
-        "BodyCustom",
+    normal_style = ParagraphStyle(
+        "NormalStyle",
         parent=styles["BodyText"],
-        fontName=font_name,
         fontSize=10,
-        leading=16,
+        leading=15,
         spaceAfter=8
     )
 
     story = []
 
+    # -----------------------------------------------------
     # TITLE
-    safe_title = (
-        title
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    # -----------------------------------------------------
 
     story.append(
         Paragraph(
-            safe_title,
+            "YouTube Video PDF",
             title_style
         )
     )
 
     story.append(
         Paragraph(
-            "YouTube Video Notes",
-            heading_style
+            title,
+            title_style
         )
     )
 
-    # THUMBNAIL
-    thumbnail = get_thumbnail(video_id)
+    story.append(Spacer(1, 10))
 
-    if thumbnail:
+    # -----------------------------------------------------
+    # THUMBNAIL
+    # -----------------------------------------------------
+
+    if thumbnail_data:
 
         try:
+            image_stream = BytesIO(thumbnail_data)
 
-            thumbnail_path = f"/tmp/thumb_{video_id}.jpg"
+            pil_image = PILImage.open(image_stream)
 
-            thumbnail.save(
-                thumbnail_path,
-                "JPEG"
+            width, height = pil_image.size
+
+            max_width = 500
+            max_height = 280
+
+            ratio = min(
+                max_width / width,
+                max_height / height
             )
 
+            new_width = width * ratio
+            new_height = height * ratio
+
+            image_stream.seek(0)
+
             img = Image(
-                thumbnail_path,
-                width=500,
-                height=281
+                image_stream,
+                width=new_width,
+                height=new_height
             )
 
             story.append(img)
             story.append(Spacer(1, 15))
 
         except Exception as e:
+            print("PDF IMAGE ERROR:", e)
 
-            print("IMAGE PDF ERROR:", e)
+    # -----------------------------------------------------
+    # VIDEO LINK
+    # -----------------------------------------------------
 
-    # SOURCE
-    safe_url = (
-        video_url
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
+    youtube_url = (
+        f"https://www.youtube.com/watch?v={video_id}"
     )
 
     story.append(
         Paragraph(
-            f"<b>YouTube:</b> {safe_url}",
-            body_style
+            f"<b>YouTube Link:</b> {youtube_url}",
+            normal_style
         )
     )
 
-    story.append(
-        Spacer(1, 10)
-    )
+    story.append(Spacer(1, 10))
 
     story.append(
         Paragraph(
-            "Transcript / Notes",
-            heading_style
+            "<b>Transcript:</b>",
+            styles["Heading2"]
         )
     )
 
-    # TEXT CHUNKS
-    words = text.split()
+    # -----------------------------------------------------
+    # TRANSCRIPT
+    # -----------------------------------------------------
 
-    chunk = []
+    if transcript:
 
-    for word in words:
+        paragraphs = transcript.split("\n")
 
-        chunk.append(word)
+        for line in paragraphs:
 
-        if len(chunk) >= 80:
+            line = line.strip()
 
-            paragraph = " ".join(chunk)
+            if not line:
+                continue
 
-            paragraph = (
-                paragraph
-                .replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
+            # Escape HTML characters
+            line = (
+                line.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
             )
 
             story.append(
                 Paragraph(
-                    paragraph,
-                    body_style
+                    line,
+                    normal_style
                 )
             )
 
-            chunk = []
-
-    if chunk:
-
-        paragraph = " ".join(chunk)
-
-        paragraph = (
-            paragraph
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-        )
+    else:
 
         story.append(
             Paragraph(
-                paragraph,
-                body_style
+                "Transcript available nahi hai.",
+                normal_style
             )
         )
+
+    # -----------------------------------------------------
+    # BUILD PDF
+    # -----------------------------------------------------
 
     doc.build(story)
 
     return filename
 
 
-# -----------------------------
-# SEND MESSAGE
-# -----------------------------
+# =========================================================
+# SEND TELEGRAM MESSAGE
+# =========================================================
+
 def send_message(chat_id, text):
 
     try:
@@ -371,7 +359,7 @@ def send_message(chat_id, text):
                 "chat_id": chat_id,
                 "text": text
             },
-            timeout=30
+            timeout=20
         )
 
     except Exception as e:
@@ -379,25 +367,26 @@ def send_message(chat_id, text):
         print("SEND MESSAGE ERROR:", e)
 
 
-# -----------------------------
+# =========================================================
 # SEND PDF
-# -----------------------------
-def send_pdf(chat_id, filename):
+# =========================================================
+
+def send_pdf(chat_id, pdf_file):
 
     try:
 
-        with open(filename, "rb") as pdf:
+        with open(pdf_file, "rb") as file:
 
             requests.post(
                 f"{TELEGRAM_API}/sendDocument",
                 data={
                     "chat_id": chat_id,
-                    "caption": "📄 Aapka YouTube PDF ready hai!"
+                    "caption": "✅ Aapka YouTube PDF ready hai!"
                 },
                 files={
-                    "document": pdf
+                    "document": file
                 },
-                timeout=120
+                timeout=60
             )
 
     except Exception as e:
@@ -405,131 +394,163 @@ def send_pdf(chat_id, filename):
         print("SEND PDF ERROR:", e)
 
 
-# -----------------------------
-# PROCESS MESSAGE
-# -----------------------------
-def process_message(message):
+# =========================================================
+# PROCESS YOUTUBE LINK
+# =========================================================
 
-    chat_id = message["chat"]["id"]
+def process_video(chat_id, url):
 
-    text = message.get(
-        "text",
-        ""
-    ).strip()
-
-    # START
-    if text == "/start":
-
-        send_message(
-            chat_id,
-
-            "👋 Welcome!\n\n"
-            "🎥 YouTube video ka link bhejo.\n\n"
-            "Main:\n"
-            "📝 Transcript nikalaunga\n"
-            "🖼️ Video thumbnail add karunga\n"
-            "📄 PDF banaunga\n\n"
-            "Aur PDF tumhe Telegram par bhej dunga. 🚀"
-        )
-
-        return
-
-    # URL CHECK
-    if not text.startswith("http"):
-
-        send_message(
-            chat_id,
-            "❌ Please YouTube video ka link bhejo."
-        )
-
-        return
-
-    # VIDEO ID
-    video_id = get_video_id(text)
+    video_id = get_video_id(url)
 
     if not video_id:
 
         send_message(
             chat_id,
-            "❌ Ye valid YouTube link nahi lag raha."
+            "❌ YouTube link sahi nahi hai.\n\n"
+            "Example:\n"
+            "https://www.youtube.com/watch?v=XXXXXXXXXXX"
         )
 
         return
 
     send_message(
         chat_id,
-        "⏳ Video check ho raha hai..."
+        "⏳ Video mil gaya!\n\n"
+        "📖 Transcript nikal raha hoon..."
+    )
+
+    title = get_video_title(video_id)
+
+    thumbnail = get_thumbnail(video_id)
+
+    transcript = get_transcript(video_id)
+
+    if not transcript:
+
+        send_message(
+            chat_id,
+            "❌ Is video ka transcript nahi mil saka.\n\n"
+            "Possible reason:\n"
+            "• YouTube captions available nahi hain\n"
+            "• YouTube ne request block ki hai\n"
+            "• Video restricted/private hai\n\n"
+            "Kisi normal public video ka link try karo."
+        )
+
+        return
+
+    send_message(
+        chat_id,
+        "📄 PDF bana raha hoon..."
     )
 
     try:
 
-        # TITLE
-        title = get_video_title(video_id)
-
-        send_message(
-            chat_id,
-            f"🎥 {title}\n\n"
-            "📝 Transcript nikala ja raha hai..."
-        )
-
-        # TRANSCRIPT
-        transcript = get_transcript(video_id)
-
-        if not transcript:
-
-            raise Exception(
-                "Empty transcript"
-            )
-
-        send_message(
-            chat_id,
-            "🖼️ Image add ki ja rahi hai...\n"
-            "📄 PDF banaya ja raha hai..."
-        )
-
-        # CREATE PDF
         pdf_file = create_pdf(
-            transcript,
-            text,
+            title,
             video_id,
-            title
+            transcript,
+            thumbnail
         )
 
-        # SEND
         send_pdf(
             chat_id,
             pdf_file
         )
 
-        # DELETE TEMP FILE
-        try:
+    except Exception as e:
 
-            os.remove(pdf_file)
-
-        except Exception:
-            pass
+        print("PDF ERROR:", repr(e))
 
         send_message(
             chat_id,
-            "✅ PDF successfully ready hai! 🎉"
+            "❌ PDF banate waqt error aa gaya."
+        )
+
+
+# =========================================================
+# TELEGRAM UPDATE HANDLER
+# =========================================================
+
+def handle_update(update):
+
+    try:
+
+        message = update.get("message")
+
+        if not message:
+            return
+
+        chat = message.get("chat")
+
+        if not chat:
+            return
+
+        chat_id = chat.get("id")
+
+        text = message.get("text", "").strip()
+
+        if not text:
+            return
+
+        # START
+        if text == "/start":
+
+            send_message(
+                chat_id,
+                "👋 Assalamualaikum!\n\n"
+                "🎥 YouTube video ka link bhejo.\n"
+                "Main uska transcript PDF bana dunga.\n\n"
+                "Example:\n"
+                "https://www.youtube.com/watch?v=XXXXXXXXXXX"
+            )
+
+            return
+
+        # HELP
+        if text == "/help":
+
+            send_message(
+                chat_id,
+                "📌 Bot ka use:\n\n"
+                "1️⃣ YouTube video ka link copy karo\n"
+                "2️⃣ Yahan send karo\n"
+                "3️⃣ Bot transcript PDF bana dega"
+            )
+
+            return
+
+        # YOUTUBE LINK
+        if (
+            "youtube.com" in text
+            or "youtu.be" in text
+        ):
+
+            threading.Thread(
+                target=process_video,
+                args=(chat_id, text),
+                daemon=True
+            ).start()
+
+            return
+
+        send_message(
+            chat_id,
+            "❌ Please sirf YouTube video ka link bhejo."
         )
 
     except Exception as e:
 
-        print("ERROR:", e)
-
-        send_message(
-            chat_id,
-
-            "❌ Is video ka transcript available nahi mila.\n\n"
-            "👉 Aisa video try karo jisme YouTube captions/subtitles available hon."
-        )
+        print("UPDATE ERROR:", repr(e))
 
 
-# -----------------------------
-# BOT LOOP
-# -----------------------------
-def bot_loop():
+# =========================================================
+# TELEGRAM LONG POLLING
+# =========================================================
+
+def telegram_bot():
+
+    print("Telegram bot started...")
 
     offset = None
 
@@ -537,55 +558,53 @@ def bot_loop():
 
         try:
 
+            params = {
+                "timeout": 30
+            }
+
+            if offset is not None:
+                params["offset"] = offset
+
             response = requests.get(
                 f"{TELEGRAM_API}/getUpdates",
-
-                params={
-                    "timeout": 50,
-                    "offset": offset
-                },
-
-                timeout=60
+                params=params,
+                timeout=40
             )
 
             data = response.json()
 
             if not data.get("ok"):
-
+                print("TELEGRAM ERROR:", data)
                 time.sleep(5)
                 continue
 
-            for update in data["result"]:
+            updates = data.get("result", [])
 
-                offset = (
-                    update["update_id"] + 1
-                )
+            for update in updates:
 
-                if "message" in update:
+                offset = update["update_id"] + 1
 
-                    process_message(
-                        update["message"]
-                    )
+                handle_update(update)
 
         except Exception as e:
 
-            print(
-                "BOT LOOP ERROR:",
-                e
-            )
+            print("POLLING ERROR:", repr(e))
 
             time.sleep(5)
 
 
-# -----------------------------
-# START
-# -----------------------------
+# =========================================================
+# START FLASK + TELEGRAM
+# =========================================================
+
 if __name__ == "__main__":
 
-    threading.Thread(
-        target=bot_loop,
+    bot_thread = threading.Thread(
+        target=telegram_bot,
         daemon=True
-    ).start()
+    )
+
+    bot_thread.start()
 
     port = int(
         os.environ.get(
@@ -597,4 +616,4 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=port
-        )
+            )
